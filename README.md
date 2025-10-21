@@ -1,4 +1,4 @@
-<p align="center">
+<p align="auto">
   <img alt="SentinelScan logo" src="https://raw.githubusercontent.com/AJulianSec/SentinelScan/main/logo_sentinel_scan.jpg" width="800"/>
 </p>
 
