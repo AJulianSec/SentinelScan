@@ -41,8 +41,10 @@ This project is ideal for students or cybersecurity professionals looking to imp
 
 ###  Installation
 
+#Clone the repository
+
 ```bash
-# Clone the repository
+
 git clone https://github.com/yourusername/SentinelScan.git
 cd SentinelScan
 ```
