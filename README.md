@@ -1,5 +1,5 @@
 <p align="center">
-  <img alt="SentinelScan logo" src="https://raw.githubusercontent.com/AJulianSec/SentinelScan/main/logo_sentinel_scan.jpg" width="320"/>
+  <img alt="SentinelScan logo" src="https://raw.githubusercontent.com/AJulianSec/SentinelScan/main/logo_sentinel_scan.jpg" width="800"/>
 </p>
 
 # 🛡️ SentinelScan
