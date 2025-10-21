@@ -1,68 +1,71 @@
+<p align="center">
+  <img alt="SentinelScan logo" src="https://raw.githubusercontent.com/AJulianSec/SentinelScan/main/logo_sentinel_scan.jpg" width="320"/>
+</p>
+
 # 🛡️ SentinelScan
 
-**SentinelScan** is an educational Python tool designed for **network reconnaissance and basic vulnerability assessment** in **authorized and controlled environments**.  
-It is intended for learning purposes, especially for **Purple Team exercises**, combining offensive and defensive techniques in a safe lab setting.
+**SentinelScan** is an educational Python tool for **network reconnaissance and basic vulnerability correlation** intended for use **only in authorized and controlled environments**.  
+It is ideal for learning, Purple Team exercises, lab training and for anyone who wants a hands‑on, ethical view into service discovery and basic vulnerability identification.
+
+> ⚠️ **Legal & Ethical Notice**  
+> SentinelScan is strictly for authorized testing (your systems, lab VMs, or explicit, written permission). Misuse against third‑party systems or networks is illegal and unethical. The author accepts no responsibility for misuse.
 
 ---
 
 ## 📋 Overview
 
-SentinelScan automates several phases of network reconnaissance, service identification, and vulnerability correlation through a **user-friendly command-line interface (CLI)**.  
-This project is ideal for students or cybersecurity professionals looking to improve their skills in **ethical hacking, defensive monitoring, and threat analysis**.
+SentinelScan automates network reconnaissance phases — port scanning, banner grabbing and local vulnerability correlation — through a simple CLI. The tool is designed to teach methodology and interpretation of results rather than to act as an offensive exploitation framework.
 
-> ⚠️ **Legal and Ethical Disclaimer:**  
-> SentinelScan must only be used on systems you own or in laboratory environments where you have explicit permission.  
-> Misuse on unauthorized systems or networks may be illegal.  
-> This software is educational and does not include exploits or intrusion mechanisms.
+Use cases:
+- Security education (students, Purple/Blue/Red team drills)
+- Quick asset discovery in a lab environment
+- Learning how banner parsing and version matching works
 
 ---
 
 ## ⚙️ Key Features
 
--  **Quick TCP Port Scan** — scan common ports rapidly.
--  **Full Port Scan (1–65535)** with optional `nmap` integration.
--  **Banner Grabbing** — identify services and versions.
--  **Educational Vulnerability Analysis** using a local JSON database.
--  **Asynchronous/Concurrent Mode** using `asyncio` for faster scans.
--  **Export Results** in JSON and CSV formats.
--  **Logging** with multiple levels and ethical warnings.
--  **Console interface with colors** (optional via `rich` library).
--  **Automated Tests** (`pytest`) for basic validation against `localhost`.
+- **Quick TCP & UDP scans** for common ports.  
+- **Full TCP scan (1–65535)** (educational; heavy scans may take long).  
+- **Banner grabbing** to capture service strings and infer versions.  
+- **Local vulnerability correlation** using a pipe‑separated `vuln_db.txt` (offline, strict substring matching).  
+- **Asynchronous worker pool** (`asyncio`) for concurrent scanning.  
+- **TXT reports** generated per-scan under `reports/<target>_<timestamp>/report.txt`.  
+- **Logging** to `logs/scanner.log` (rotating file handler).  
+- Optional colored console output / progress bars if [`rich`] is installed.  
+- Designed to run on Linux, WSL2 or Windows with Python 3.11+.
 
 ---
 
-##  Requirements & Installation
+## 📥 Requirements & Installation
 
-###  System Requirements
-- Python 3.10 or higher  
-- pip (Python package manager)  
-- (Optional) `nmap` installed on the system  
-- OS: Windows, Linux, or WSL2
+### System requirements
+- **Python 3.11+** (recommended)  
+- `pip` (Python package manager)  
+- Optional: `nmap` (for users who want to extend integration)  
+- OS: Linux, macOS, Windows or WSL2
 
-###  Installation
-
-#Clone the repository
+### Quick install
 
 ```bash
-
-git clone https://github.com/yourusername/SentinelScan.git
+# Clone the repository (use your fork / upstream as needed)
+git clone https://github.com/AJulianSec/SentinelScan.git
 cd SentinelScan
 ```
-
-# Create a virtual environment
+# Create & activate a virtual environment (recommended)
 ```bash
 python -m venv venv
 ```
-# Activate (Windows)
+# Windows
 ```bash
 venv\Scripts\activate
 ```
-# Activate (Linux/Mac)
+# Linux / macOS
 ```bash
 source venv/bin/activate
 ```
-
-# Install dependencies
-```bash 
+# Install Python dependencies
+```bash
 pip install -r requirements.txt
-``````
+```
+
