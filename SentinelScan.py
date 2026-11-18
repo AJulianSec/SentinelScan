@@ -1,36 +1,45 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-SentinelScan - UDP & TCP + IPv6 (educational) - Single-file CLI interactive scanner (text in English)
-Requires exact consent "I AGREE"
-Reports: reports/<target>_<ts>/report.txt
-Logs: logs/scanner.log
-Asynchronous worker-pool, progress with rich if installed
-Vulnerability DB: vuln_db.txt (pipe-separated TXT strict matching)
-Educational use, show legal warning
-Recommended Python 3.11+, designed for Linux but may run on Windows
+SentinelScan
 
-This version fixes menu options 6 and 7:
- - option 6 now locates the last report robustly (uses last_report_path if valid, otherwise searches the reports directory for the most recent report for the last target or any target).
- - option 7's tail_log now correctly looks for rotated logs in the logs directory if the primary LOG_FILE doesn't exist and prints using the same UI path (_print).
+Small educational scanner for local or explicitly authorized targets.
+It checks TCP and UDP ports, tries to collect service banners and compares
+them with a local text database of example vulnerability entries.
+
+The program requires the exact consent message "I AGREE" in interactive mode.
+Use it only for systems you own or have permission to test.
+
+Reports:
+    reports/<target>_<timestamp>/report.txt
+    reports/<target>_<timestamp>/report.json
+
+Log file:
+    logs/scanner.log
+
+The application uses an asynchronous worker pool and can show progress with
+Rich when that optional package is installed. Python 3.11 or newer is
+recommended.
 """
 from __future__ import annotations
 
 import asyncio
+import argparse
+import csv
+import html
 import ipaddress
+import json
 import logging
 import logging.handlers
-import os
 import re
 import socket
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from shutil import which
 from typing import Any, Dict, List, Optional, Tuple
 
-# Optional rich
+# Rich is optional, so the program can also run in a plain terminal.
 try:
     from rich.console import Console
     from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn
@@ -42,9 +51,7 @@ except Exception:
     RICH_AVAILABLE = False
     console = None
 
-# ---------------------
-# Config
-# ---------------------
+# Configuration
 AUTHOR = "Your Name Here"
 DEFAULT_TIMEOUT = 1.0
 DEFAULT_CONCURRENCY = 200
@@ -52,18 +59,17 @@ COMMON_TCP_PORTS = [21, 22, 23, 25, 53, 80, 110, 139, 143, 443, 445, 3306, 3389,
 COMMON_UDP_PORTS = [53, 67, 68, 69, 123, 161, 500, 520]
 MAX_CONCURRENCY = 1000
 
-LOG_DIR = Path("logs")
+BASE_DIR = Path(__file__).resolve().parent
+LOG_DIR = BASE_DIR / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 LOG_FILE = LOG_DIR / "scanner.log"
 
-VULN_DB_FILE = Path("vuln_db.txt")
+VULN_DB_FILE = BASE_DIR / "vuln_db.txt"
 
-REPORTS_DIR = Path("reports")
+REPORTS_DIR = BASE_DIR / "reports"
 REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
-# ---------------------
 # Logging
-# ---------------------
 logger = logging.getLogger("sentinelscan")
 if not logger.handlers:
     logger.setLevel(logging.INFO)
@@ -75,9 +81,7 @@ if not logger.handlers:
     sh.setFormatter(fmt)
     logger.addHandler(sh)
 
-# ---------------------
-# Helpers (printing)
-# ---------------------
+# Terminal output helpers
 
 
 def _print(msg: str, style: Optional[str] = None) -> None:
@@ -94,16 +98,14 @@ def _panel(text: str, title: str = "") -> None:
         print(f"--- {title} ---\n{text}\n")
 
 
-# ---------------------
-# Network utils (IPv4/IPv6 aware)
-# ---------------------
+# Network helpers
 
 
 def resolve_host(target: str) -> Optional[str]:
-    """Resolve hostname to the first usable IP (prefer IPv4, then IPv6).
-    Returns the IP as a string or None.
-    """
+    """Resolve a hostname and return the first IPv4 address, or an IPv6 address."""
     try:
+        # This call can return several network addresses, especially when the
+        # target is a domain with both IPv4 and IPv6 records.
         infos = socket.getaddrinfo(target, None)
         ipv4 = [i for i in infos if i[0] == socket.AF_INET]
         if ipv4:
@@ -130,12 +132,18 @@ def _safe_decode(b: bytes) -> str:
         return repr(b)
 
 
-# ---------------------
-# Blocking TCP banner & UDP probe (used inside thread pool)
-# ---------------------
+def validate_port(port: int) -> bool:
+    # Port numbers start at 1 for normal use. Zero and values above 65535
+    # cannot represent valid TCP or UDP ports and must be rejected here.
+    return isinstance(port, int) and not isinstance(port, bool) and 1 <= port <= 65535
+
+
+# TCP and UDP checks
 
 
 def _blocking_tcp_check(ip: str, port: int, timeout: float) -> Tuple[int, bool, Optional[str]]:
+    if not validate_port(port):
+        return port, False, None
     try:
         family = socket.AF_INET6 if ':' in ip else socket.AF_INET
         with socket.socket(family, socket.SOCK_STREAM) as s:
@@ -144,6 +152,8 @@ def _blocking_tcp_check(ip: str, port: int, timeout: float) -> Tuple[int, bool, 
             if res != 0:
                 return port, False, None
             try:
+                # If the connection succeeds, waiting briefly for an initial
+                # message allows SentinelScan to collect the most useful banner.
                 s.settimeout(min(1.0, timeout))
                 data = s.recv(4096)
                 if data:
@@ -158,15 +168,16 @@ def _blocking_tcp_check(ip: str, port: int, timeout: float) -> Tuple[int, bool, 
 
 
 def _blocking_udp_check(ip: str, port: int, timeout: float) -> Tuple[int, bool, Optional[str]]:
-    """Send an empty UDP datagram and wait for response or indirect ICMP unreachable.
-    Note: on many networks UDP scanning yields "open|filtered" false positives; this is educational only.
-    Returns (port, maybe_open, banner)
-    """
+    """Return open|filtered when the port does not respond."""
+    if not validate_port(port):
+        return port, False, None
     try:
         family = socket.AF_INET6 if ':' in ip else socket.AF_INET
         with socket.socket(family, socket.SOCK_DGRAM) as s:
             s.settimeout(timeout)
             try:
+                # The line sent is only a small test packet. It should not be
+                # interpreted as a complete request for any UDP application.
                 s.sendto(b"\n", (ip, port))
             except Exception:
                 return port, False, None
@@ -176,19 +187,18 @@ def _blocking_udp_check(ip: str, port: int, timeout: float) -> Tuple[int, bool, 
                     return port, True, _safe_decode(data).strip()
                 return port, True, None
             except socket.timeout:
-                # No response: could be filtered, closed (ICMP), or open-but-no-response.
-                # For educational strictness we'll mark as 'filtered/unknown' -> False
-                return port, False, None
+                # UDP does not confirm a port as closed by design. Waiting for
+                # a response cannot distinguish open ports from filtered ones.
+                return port, False, "open|filtered"
             except Exception:
                 return port, False, None
     except Exception:
         return port, False, None
 
 
-# ---------------------
-# Vulnerability DB (TXT) - simple pipe-separated format
-# service|version_contains|cve_id|cvss|severity|summary|recommendation
-# ---------------------
+# Local vulnerability database
+# Format:
+# service|version_expression|cve_id|cvss|severity|summary|recommendation
 
 
 def ensure_vuln_db_exists() -> None:
@@ -237,17 +247,19 @@ def load_vuln_db_txt() -> List[Dict[str, Any]]:
     return results
 
 
-# ---------------------
 # Banner parsing
-# ---------------------
 BANNER_SERVICE_VERSION_REGEXES = [
-    re.compile(r"(?P<service>[A-Za-z0-9_\-]+)[/ _\-]?v?(?P<version>\d+(?:\.\d+){0,3})", re.IGNORECASE),
     re.compile(r"(?P<service>openssh)[\s_/\-]?_?v?(?P<version>\d+(?:\.\d+)*)", re.IGNORECASE),
     re.compile(r"(?P<service>apache)[/ _\-]?v?(?P<version>\d+(?:\.\d+)*)", re.IGNORECASE),
+    re.compile(r"(?P<service>nginx)[/ _\-]?v?(?P<version>\d+(?:\.\d+)*)", re.IGNORECASE),
+    re.compile(r"(?P<service>[A-Za-z0-9_\-]+)[/ _\-]?v?(?P<version>\d+(?:\.\d+){0,3})", re.IGNORECASE),
 ]
 
 
 def parse_banner_service_version(banner: str) -> Tuple[Optional[str], Optional[str]]:
+    # This parser tries the most recognizable formats first. If no complete
+    # service and version pair is found, it checks known service names in the
+    # beginning of the banner before returning an unknown result.
     if not banner:
         return None, None
     for rx in BANNER_SERVICE_VERSION_REGEXES:
@@ -266,9 +278,7 @@ def parse_banner_service_version(banner: str) -> Tuple[Optional[str], Optional[s
     return None, None
 
 
-# ---------------------
-# Vulnerability analysis (strict substring matching against txt DB)
-# ---------------------
+# Vulnerability analysis
 
 
 def severity_suggested_actions(severity: str) -> List[str]:
@@ -297,11 +307,57 @@ def severity_suggested_actions(severity: str) -> List[str]:
     return ["No automated recommendation available."]
 
 
-def vuln_analysis_from_banners_txt(banners: Dict[int, Optional[str]]) -> List[Dict[str, Any]]:
+def version_matches(detected: Optional[str], version_expression: str) -> bool:
+    """Compare a detected version with a substring or a simple numeric range."""
+    if not detected or not version_expression:
+        return False
+    expression = version_expression.strip()
+    if expression.startswith((">=", "<=", "==", "!=")):
+        # Numeric ranges are safer than loose text matching. Splitting the
+        # version at each dot lets the function compare 6.10 correctly as
+        # newer than 6.9 rather than comparing the text from left to right.
+        try:
+            detected_parts = tuple(int(part) for part in detected.split('.'))
+        except (TypeError, ValueError):
+            return False
+        for rule in expression.split(','):
+            rule = rule.strip()
+            match = re.fullmatch(r"(>=|<=|==|!=|>|<)\s*(\d+(?:\.\d+)*)", rule)
+            if not match:
+                return False
+            operator, required_text = match.groups()
+            required_parts = tuple(int(part) for part in required_text.split('.'))
+            width = max(len(detected_parts), len(required_parts))
+            left = detected_parts + (0,) * (width - len(detected_parts))
+            right = required_parts + (0,) * (width - len(required_parts))
+            if operator == ">=" and not left >= right:
+                return False
+            if operator == "<=" and not left <= right:
+                return False
+            if operator == "==" and not left == right:
+                return False
+            if operator == "!=" and not left != right:
+                return False
+            if operator == ">" and not left > right:
+                return False
+            if operator == "<" and not left < right:
+                return False
+        return True
+    return expression.lower() in detected.lower()
+
+
+def vuln_analysis_from_banners_txt(banners: Dict[Any, Optional[str]]) -> List[Dict[str, Any]]:
     db = load_vuln_db_txt()
     matches: List[Dict[str, Any]] = []
-    for port, banner in banners.items():
+    for port_key, banner in banners.items():
         if not banner:
+            continue
+        try:
+            # Port keys may include a protocol, such as tcp/22, or may simply
+            # contain the number. The report stores the numeric port separately.
+            port_label = str(port_key)
+            port = int(port_label.split('/', 1)[1]) if '/' in port_label else int(port_label)
+        except (TypeError, ValueError):
             continue
         svc, ver = parse_banner_service_version(banner)
         banner_lower = banner.lower()
@@ -310,16 +366,17 @@ def vuln_analysis_from_banners_txt(banners: Dict[int, Optional[str]]) -> List[Di
             ver_sub = (entry.get('version_contains') or '').lower()
             matched = False
             matched_string = None
-            if svc and svc_entry and svc_entry in svc and ver_sub:
-                if ver and ver_sub in ver.lower():
+            if svc_entry and ver_sub:
+                if svc and svc_entry in svc and ver and version_matches(ver, ver_sub):
                     matched = True
                     matched_string = ver
-            if not matched and ver_sub and ver_sub in banner_lower:
-                matched = True
-                matched_string = ver_sub
-            if not matched and svc_entry and svc_entry in banner_lower:
-                matched = True
-                matched_string = svc_entry
+            if not matched and svc_entry and ver_sub and svc_entry in banner_lower:
+                detected_banner_ver = ver or re.search(r"(\d+(?:\.\d+)*)", banner_lower)
+                if isinstance(detected_banner_ver, re.Match):
+                    detected_banner_ver = detected_banner_ver.group(1)
+                if detected_banner_ver and version_matches(detected_banner_ver, ver_sub):
+                    matched = True
+                    matched_string = detected_banner_ver
             if matched:
                 matches.append({
                     'port': port,
@@ -338,9 +395,7 @@ def vuln_analysis_from_banners_txt(banners: Dict[int, Optional[str]]) -> List[Di
     return matches
 
 
-# ---------------------
-# Async thread-backed attempts (TCP/UDP)
-# ---------------------
+# Asynchronous network operations
 
 
 async def _attempt_connect_in_thread(ip: str, port: int, timeout: float, proto: str = 'tcp') -> Tuple[int, bool, Optional[str]]:
@@ -366,6 +421,9 @@ async def _worker(queue: asyncio.Queue, results: Dict[str, Dict[str, Optional[st
         try:
             port, ip, proto = await queue.get()
             async with sem:
+                # The semaphore keeps network usage under control even when there
+                # are thousands of queued ports. Each result is stored under the
+                # protocol and port so TCP and UDP cannot overwrite each other.
                 p, is_open, banner = await _attempt_connect_in_thread(ip, port, timeout, proto)
                 key = f"{proto}/{p}"
                 results[key] = {"open": is_open, "banner": banner}
@@ -439,15 +497,13 @@ async def scan_ports_async_with_progress(ip: str, tasks: List[Tuple[int, str]], 
     return results
 
 
-# ---------------------
-# Report writing (TXT only)
-# ---------------------
+# Report writing
 
 
 def create_scan_paths(target: str, ts: Optional[datetime] = None) -> Tuple[Path, Path]:
     if ts is None:
-        ts = datetime.utcnow()
-    stamp = ts.strftime("%Y%m%d_%H%M%S")
+        ts = datetime.now(timezone.utc)
+    stamp = ts.strftime("%Y%m%d_%H%M%S_%f")
     safe_target = re.sub(r"[^A-Za-z0-9._-]", "_", target)
     dir_path = REPORTS_DIR / f"{safe_target}_{stamp}"
     dir_path.mkdir(parents=True, exist_ok=True)
@@ -458,10 +514,12 @@ def create_scan_paths(target: str, ts: Optional[datetime] = None) -> Tuple[Path,
 def write_txt_report(payload: Dict[str, Any], report_path: Path) -> Path:
     try:
         lines: List[str] = []
+        # The text report follows a fixed structure: summary, open ports,
+        # vulnerability matches and a final section explaining limitations.
         lines.append("Scan Report")
         lines.append("=" * 80)
         lines.append(f"Author : {AUTHOR}")
-        lines.append(f"Date : {datetime.utcnow().isoformat()}Z")
+        lines.append(f"Date : {datetime.now(timezone.utc).isoformat()}")
         lines.append(f"Target : {payload.get('target')} ({payload.get('ip')})")
         lines.append(f"Duration: {payload.get('duration', 0.0):.2f}s")
         lines.append("")
@@ -481,6 +539,13 @@ def write_txt_report(payload: Dict[str, Any], report_path: Path) -> Path:
                     lines.append(f" - {k} OPEN banner: {banner}")
         else:
             lines.append(" - None found among scanned ports.")
+
+        udp_unknown = [k for k, info in port_items if info.get('banner') == 'open|filtered']
+        if udp_unknown:
+            lines.append("")
+            lines.append("UDP observations (not confirmed open):")
+            for k in udp_unknown:
+                lines.append(f" - {k} OPEN|FILTERED (no response received)")
 
         lines.append("")
         lines.append("Vulnerability Analysis (LOCAL TXT DB - strict match):")
@@ -502,8 +567,8 @@ def write_txt_report(payload: Dict[str, Any], report_path: Path) -> Path:
 
         lines.append("Methodology / Caveats:")
         lines.append(" - This analysis uses a local offline example database (vuln_db.txt).")
-        lines.append(" - Matching is STRICT: 'version_contains' must appear in the detected version or in the banner (case-insensitive).")
-        lines.append(" - UDP scanning is lossy and may produce false negatives; it's implemented for educational use only.")
+        lines.append(" - Matching requires both a recognized service name and a version substring (case-insensitive).")
+        lines.append(" - UDP open|filtered means no response was received; this is not confirmation that the port is open.")
         lines.append(" - Use authorized scopes only. The tool logs consent and operations.")
         lines.append("")
 
@@ -515,15 +580,132 @@ def write_txt_report(payload: Dict[str, Any], report_path: Path) -> Path:
         raise
 
 
-# ---------------------
-# Helpers for menu fixes: find latest report and robust tail for logs
-# ---------------------
+def write_json_report(payload: Dict[str, Any], report_path: Path) -> Path:
+    json_path = report_path.with_suffix(".json")
+    try:
+        # A shallow copy keeps the original scan payload available while adding
+        # file metadata that is useful when the JSON is opened later.
+        json_payload = dict(payload)
+        json_payload["generated_at"] = datetime.now(timezone.utc).isoformat()
+        json_payload["author"] = AUTHOR
+        json_path.write_text(json.dumps(json_payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        logger.info("JSON report written -> %s", json_path)
+        return json_path
+    except Exception as e:
+        logger.exception("Failed to write JSON report: %s", e)
+        raise
+
+
+def write_csv_report(payload: Dict[str, Any], report_path: Path) -> Path:
+    csv_path = report_path.with_suffix(".csv")
+    try:
+        with csv_path.open("w", newline="", encoding="utf-8") as fh:
+            writer = csv.writer(fh)
+            writer.writerow(["protocol", "port", "status", "banner"])
+            for result_key, info in sorted(payload.get("ports", {}).items()):
+                parts = result_key.split("/", 1)
+                protocol = parts[0] if len(parts) == 2 else ""
+                port = parts[1] if len(parts) == 2 else result_key
+                banner = info.get("banner")
+                if banner == "open|filtered":
+                    status = "open|filtered"
+                elif info.get("open"):
+                    status = "open"
+                else:
+                    status = "closed"
+                writer.writerow([protocol, port, status, banner or "-"])
+        logger.info("CSV report written -> %s", csv_path)
+        return csv_path
+    except Exception as e:
+        logger.exception("Failed to write CSV report: %s", e)
+        raise
+
+
+def write_html_report(payload: Dict[str, Any], report_path: Path) -> Path:
+    html_path = report_path.with_suffix(".html")
+    try:
+        rows: List[str] = []
+        for result_key, info in sorted(payload.get("ports", {}).items()):
+            parts = result_key.split("/", 1)
+            protocol = parts[0] if len(parts) == 2 else ""
+            port = parts[1] if len(parts) == 2 else result_key
+            banner = info.get("banner")
+            if banner == "open|filtered":
+                status, css_class = "open|filtered", "filtered"
+            elif info.get("open"):
+                status, css_class = "open", "open"
+            else:
+                status, css_class = "closed", "closed"
+            rows.append(
+                "<tr>"
+                f"<td>{html.escape(protocol)}</td>"
+                f"<td>{html.escape(str(port))}</td>"
+                f"<td class=\"{css_class}\">{status}</td>"
+                f"<td>{html.escape(str(banner or '-'))}</td>"
+                "</tr>"
+            )
+
+        vuln_rows: List[str] = []
+        for match in payload.get("vuln_matches") or []:
+            vuln_rows.append(
+                "<tr>"
+                f"<td>{html.escape(str(match.get('port')))}</td>"
+                f"<td>{html.escape(str(match.get('service') or '-'))}</td>"
+                f"<td>{html.escape(str(match.get('cve_id') or '-'))}</td>"
+                f"<td>{html.escape(str(match.get('severity') or '-'))}</td>"
+                f"<td>{html.escape(str(match.get('summary') or '-'))}</td>"
+                "</tr>"
+            )
+
+        document = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SentinelScan report</title>
+  <style>
+    body {{ font-family: Arial, sans-serif; margin: 2rem; color: #202124; }}
+    h1, h2 {{ color: #182b49; }}
+    table {{ border-collapse: collapse; width: 100%; margin-bottom: 2rem; }}
+    th, td {{ border: 1px solid #d7dce2; padding: .55rem; text-align: left; }}
+    th {{ background: #eef3f8; }}
+    .open {{ color: #18794e; font-weight: bold; }}
+    .filtered {{ color: #9a6700; font-weight: bold; }}
+    .closed {{ color: #656a70; }}
+    .notice {{ background: #fff7d6; border-left: 4px solid #d4a72c; padding: .75rem; }}
+  </style>
+</head>
+<body>
+  <h1>SentinelScan Report</h1>
+  <p><strong>Target:</strong> {html.escape(str(payload.get('target')))} ({html.escape(str(payload.get('ip')))})</p>
+  <p><strong>Duration:</strong> {float(payload.get('duration', 0.0)):.2f}s</p>
+  <p class="notice">UDP open|filtered means no response was received. It is not a confirmed open port.</p>
+  <h2>Port results</h2>
+  <table>
+    <thead><tr><th>Protocol</th><th>Port</th><th>Status</th><th>Banner</th></tr></thead>
+    <tbody>{''.join(rows) or '<tr><td colspan="4">No port results</td></tr>'}</tbody>
+  </table>
+  <h2>Vulnerability matches</h2>
+  <table>
+    <thead><tr><th>Port</th><th>Service</th><th>CVE</th><th>Severity</th><th>Summary</th></tr></thead>
+    <tbody>{''.join(vuln_rows) or '<tr><td colspan="5">No matches in the local database</td></tr>'}</tbody>
+  </table>
+</body>
+</html>
+"""
+        html_path.write_text(document, encoding="utf-8")
+        logger.info("HTML report written -> %s", html_path)
+        return html_path
+    except Exception as e:
+        logger.exception("Failed to write HTML report: %s", e)
+        raise
+
+
+# Report and log helpers
 
 
 def find_latest_report(target: Optional[str] = None) -> Optional[Path]:
-    """Search reports/ for the most recent report for given target (or any if target is None).
-    Returns Path to report.txt or None.
-    """
+    """Find the newest report.txt for a target, or for all targets if no target is given."""
     try:
         candidates = []
         for d in REPORTS_DIR.iterdir():
@@ -550,7 +732,7 @@ def tail_log(lines: int = 50) -> None:
         if LOG_FILE.exists():
             path = LOG_FILE
         else:
-            # look for any file in logs dir and choose the newest
+            # There is no active log file, so use the newest rotated file.
             files = [p for p in LOG_DIR.iterdir() if p.is_file()]
             if not files:
                 _print("No log file available.")
@@ -565,9 +747,7 @@ def tail_log(lines: int = 50) -> None:
         _print(f"Failed to read log file: {e}")
 
 
-# ---------------------
-# High-level actions
-# ---------------------
+# Scan actions
 
 
 async def action_quick_scan(target: str, timeout: float, concurrency: int) -> Dict[str, Any]:
@@ -579,7 +759,7 @@ async def action_quick_scan(target: str, timeout: float, concurrency: int) -> Di
     ports_res = await scan_ports_async_with_progress(ip, tasks, timeout, concurrency, show_rich=True)
     duration = time.time() - start
     payload_ports = {str(k): v for k, v in ports_res.items()}
-    banners = {int(k.split('/', 1)[1]) if '/' in k else k: v.get('banner') for k, v in ports_res.items()}
+    banners = {k: v.get('banner') for k, v in ports_res.items()}
     vuln_matches = vuln_analysis_from_banners_txt(banners)
     return {"target": target, "ip": ip, "duration": duration, "ports": payload_ports, "vuln_matches": vuln_matches}
 
@@ -587,18 +767,18 @@ async def action_quick_scan(target: str, timeout: float, concurrency: int) -> Di
 async def action_full_scan(target: str, timeout: float, concurrency: int) -> Dict[str, Any]:
     ip = resolve_host(target) or target
     ports = list(range(1, 65536))
+    # A full TCP scan reaches every port, while UDP is limited to a small
+    # selection because sending every UDP packet would be too slow and noisy.
     tasks = [(p, 'tcp') for p in ports] + [(p, 'udp') for p in (1, 53, 67, 68, 69, 123, 161, 500, 520)]
     start = time.time()
     ports_res = await scan_ports_async_with_progress(ip, tasks, timeout, concurrency, show_rich=True)
     duration = time.time() - start
     payload_ports = {str(k): v for k, v in ports_res.items()}
-    banners = {int(k.split('/', 1)[1]) if '/' in k else k: v.get('banner') for k, v in ports_res.items()}
+    banners = {k: v.get('banner') for k, v in ports_res.items()}
     vuln_matches = vuln_analysis_from_banners_txt(banners)
     return {"target": target, "ip": ip, "duration": duration, "ports": payload_ports, "vuln_matches": vuln_matches}
 
-# ---------------------
-# Banner grab (sync)
-# ---------------------
+# Single-port banner grab
 
 
 def action_banner_grab(target: str, port: int, proto: str, timeout: float) -> Dict[str, Any]:
@@ -609,9 +789,7 @@ def action_banner_grab(target: str, port: int, proto: str, timeout: float) -> Di
         p, is_open, banner = _blocking_udp_check(ip, port, timeout)
     return {"target": target, "ip": ip, "port": port, "proto": proto, "banner": banner, "open": is_open}
 
-# ---------------------
-# CLI
-# ---------------------
+# Interactive menu
 
 
 def print_menu() -> None:
@@ -630,6 +808,9 @@ async def main_cli_loop() -> None:
     _print("=== SentinelScan ===", style="bold cyan" if RICH_AVAILABLE else None)
     _print("Educational tool: use only on authorized systems. UNETHICAL use is PROHIBITED.")
     _print('Type exactly: I AGREE to accept the legal notice and continue.')
+    # This first confirmation is mandatory. It is deliberately simple and
+    # recorded in the log, but it does not replace explicit authorization for
+    # a real system or network that belongs to another person or organization.
     consent = input("Consent (type I AGREE to continue): ").strip()
     logger.info("User consent: %s", consent)
     if consent != "I AGREE":
@@ -653,6 +834,9 @@ async def main_cli_loop() -> None:
                 _print("Could not resolve the target. Enter a valid hostname or IP.")
                 continue
             if not (target in ("localhost", "127.0.0.1", "::1") or is_private_ip(ip)):
+                # Public targets receive an additional confirmation before any
+                # packet is sent. The second message includes the exact target
+                # name so that accidental confirmation is less likely.
                 _print(f"Target {target} resolves to {ip}, it appears to be external.")
                 confirm = input(f"Type '{target} PERMISSION' to confirm authorization: ").strip()
                 logger.info("External confirm: %s", confirm)
@@ -667,6 +851,9 @@ async def main_cli_loop() -> None:
             last_report_path = Path(report_path)
             try:
                 write_txt_report(payload, last_report_path)
+                write_json_report(payload, last_report_path)
+                write_csv_report(payload, last_report_path)
+                write_html_report(payload, last_report_path)
                 open_ports = [p for p, info in payload.get('ports', {}).items() if info.get('open')]
                 _print("[+] Quick scan completed.")
                 _print(f" Open ports found: {len(open_ports)}")
@@ -707,6 +894,9 @@ async def main_cli_loop() -> None:
             payload["duration"] = elapsed
             try:
                 write_txt_report(payload, last_report_path)
+                write_json_report(payload, last_report_path)
+                write_csv_report(payload, last_report_path)
+                write_html_report(payload, last_report_path)
                 open_ports = [p for p, info in payload.get('ports', {}).items() if info.get('open')]
                 vuln_matches = payload.get('vuln_matches') or []
                 _print("[+] Full scan completed.")
@@ -729,6 +919,9 @@ async def main_cli_loop() -> None:
                 port = int(port_s)
             except Exception:
                 _print("Invalid port.")
+                continue
+            if not validate_port(port):
+                _print("Invalid port. Choose a value from 1 to 65535.")
                 continue
             if proto not in ('tcp', 'udp'):
                 _print("Invalid protocol. Use tcp or udp.")
@@ -761,6 +954,9 @@ async def main_cli_loop() -> None:
                 last_report_path = Path(report_path)
             try:
                 write_txt_report(last_payload, last_report_path)
+                write_json_report(last_payload, last_report_path)
+                write_csv_report(last_payload, last_report_path)
+                write_html_report(last_payload, last_report_path)
                 _print(f"[+] Vulnerability analysis complete. TXT report: {last_report_path}")
                 _print(f" Vulnerability matches found: {len(vmatches)}")
             except Exception as e:
@@ -774,12 +970,12 @@ async def main_cli_loop() -> None:
                 _print("Invalid concurrency. Using previous value.")
 
         elif choice == "6":
-            # Show last report path, try robust lookup if necessary
+            # Find the report in memory first, and search the reports folder as a fallback.
             if last_report_path and last_report_path.exists():
                 _print(f"Last report: {last_report_path}")
                 _print("You can view it with: less " + str(last_report_path))
             else:
-                # try to find the latest report for the last target first, then any
+                # Check the last target first, then look for any report.
                 found = find_latest_report(last_target) or find_latest_report(None)
                 if found:
                     last_report_path = found
@@ -789,7 +985,7 @@ async def main_cli_loop() -> None:
                     _print("No report generated yet or report file not found on disk.")
 
         elif choice == "7":
-            # Tail logs: improved behavior to handle missing primary log file and rotated logs
+            # Show the latest log entries, including rotated logs if needed.
             tail_log(80)
 
         elif choice == "8":
@@ -799,17 +995,87 @@ async def main_cli_loop() -> None:
         else:
             _print("Invalid selection. Choose an option 1-8.")
 
-# ---------------------
-# Entrypoint
-# ---------------------
+# Command-line entry point
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="SentinelScan - authorized educational port scanner")
+    parser.add_argument("--target", help="Hostname or IP address")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--quick", action="store_true", help="Scan common TCP/UDP ports")
+    mode.add_argument("--full", action="store_true", help="Scan all TCP ports and selected UDP ports")
+    mode.add_argument("--banner", action="store_true", help="Grab a single service banner")
+    parser.add_argument("--port", type=int, help="Port for --banner")
+    parser.add_argument("--protocol", choices=("tcp", "udp"), default="tcp", help="Protocol for --banner")
+    parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
+    parser.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY)
+    parser.add_argument("--format", choices=("txt", "json", "csv", "html", "both", "all"), default="all")
+    parser.add_argument("--yes", action="store_true", help="Confirm authorization for an external target")
+    parser.add_argument("--debug", "-d", action="store_true")
+    return parser
+
+
+async def run_headless(args: argparse.Namespace) -> int:
+    if not args.target:
+        _print("The --target argument is required in non-interactive mode.")
+        return 2
+    ip = resolve_host(args.target)
+    if ip is None:
+        _print("Could not resolve the target.")
+        return 2
+    if not (args.target in ("localhost", "127.0.0.1", "::1") or is_private_ip(ip)):
+        if not args.yes:
+            _print("External target blocked. Use --yes only if you are explicitly authorized.")
+            return 2
+        logger.info("External target authorized via --yes: %s (%s)", args.target, ip)
+
+    timeout = max(0.1, args.timeout)
+    concurrency = max(1, min(MAX_CONCURRENCY, args.concurrency))
+
+    if args.banner:
+        if args.port is None or not validate_port(args.port):
+            _print("Invalid banner port. Choose a value from 1 to 65535.")
+            return 2
+        result = action_banner_grab(args.target, args.port, args.protocol, timeout)
+        payload = {
+            "target": args.target,
+            "ip": ip,
+            "duration": 0.0,
+            "ports": {f"{args.protocol}/{args.port}": {"open": result["open"], "banner": result["banner"]}},
+            "vuln_matches": [],
+        }
+        payload["vuln_matches"] = vuln_analysis_from_banners_txt(
+            {f"{args.protocol}/{args.port}": result["banner"]}
+        )
+    elif args.full:
+        payload = await action_full_scan(args.target, timeout, concurrency)
+    else:
+        payload = await action_quick_scan(args.target, timeout, concurrency)
+
+    report_path, _ = create_scan_paths(args.target)
+    if args.format in ("txt", "both", "all"):
+        write_txt_report(payload, report_path)
+    if args.format in ("json", "both", "all"):
+        write_json_report(payload, report_path)
+    if args.format in ("csv", "all"):
+        write_csv_report(payload, report_path)
+    if args.format in ("html", "all"):
+        write_html_report(payload, report_path)
+    _print(f"Scan report: {report_path.parent}")
+    return 0
 
 
 def main() -> None:
-    if len(sys.argv) > 1 and sys.argv[1] in ("--debug", "-d"):
+    parser = build_parser()
+    args = parser.parse_args()
+    if args.debug:
         logger.setLevel(logging.DEBUG)
         logger.debug("Debug logging enabled.")
     logger.info("Starting SentinelScan — Author: %s", AUTHOR)
     try:
+        if args.target or args.quick or args.full or args.banner:
+            exit_code = asyncio.run(run_headless(args))
+            raise SystemExit(exit_code)
         asyncio.run(main_cli_loop())
     except KeyboardInterrupt:
         _print("\nInterrupted by user.")
