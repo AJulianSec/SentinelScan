@@ -1,8 +1,12 @@
 # SentinelScan
 
+<p align="center">
+  <img src="logo_sentinel_scan.jpg" alt="SentinelScan logo" width="600">
+</p>
+
 ![Python](https://img.shields.io/badge/Python-3.11+-3776AB?logo=python&logoColor=white)
 ![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20WSL2-4B8BBE)
-![Status](https://img.shields.io/badge/Status-Prototype-orange)
+![Status](https://img.shields.io/badge/Status-Stable-success)
 
 **SentinelScan** is an educational Python application for network reconnaissance and basic local vulnerability correlation.
 
@@ -165,6 +169,8 @@ python SentinelScan.py --target localhost --quick --format html
 python SentinelScan.py --target localhost --quick --format all
 ```
 
+`both` writes the text and JSON reports. `all` writes text, JSON, CSV and HTML reports.
+
 The default format is `all`.
 
 ### Available options
@@ -246,7 +252,8 @@ SentinelScan/
 └── reports/
 ```
 
-Generated reports and logs are created next to the script when the program runs.
+Generated reports and logs are created next to the script in a writable source checkout.
+When SentinelScan is installed outside a writable source checkout, set `SENTINELSCAN_DATA_DIR` to choose a writable data directory. Otherwise SentinelScan stores logs and reports under the operating-system user data directory.
 
 ## Testing
 

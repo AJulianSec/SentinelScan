@@ -13,6 +13,12 @@ spec.loader.exec_module(sentinelscan)
 
 
 class SentinelScanTests(unittest.TestCase):
+    def test_parser_accepts_documented_formats(self):
+        parser = sentinelscan.build_parser()
+        for report_format in ("txt", "json", "csv", "html", "both", "all"):
+            args = parser.parse_args(["--target", "localhost", "--format", report_format])
+            self.assertEqual(args.format, report_format)
+
     def test_validate_port(self):
         self.assertTrue(sentinelscan.validate_port(1))
         self.assertTrue(sentinelscan.validate_port(65535))
@@ -29,6 +35,37 @@ class SentinelScanTests(unittest.TestCase):
         self.assertTrue(sentinelscan.version_matches("6.7", "6."))
         self.assertTrue(sentinelscan.version_matches("6.7", ">=6.0,<7.0"))
         self.assertFalse(sentinelscan.version_matches("7.4", ">=6.0,<7.0"))
+        self.assertTrue(sentinelscan.version_matches("6.7", ">6.0,<7.0"))
+        self.assertTrue(sentinelscan.version_matches("6.7", "<7.0"))
+        self.assertFalse(sentinelscan.version_matches("7.0", "<7.0"))
+
+    def test_csv_banner_formula_is_neutralized(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "report.txt"
+            payload = {
+                "target": "localhost",
+                "ip": "127.0.0.1",
+                "duration": 0.1,
+                "ports": {"tcp/80": {"open": True, "banner": "=HYPERLINK(\"https://example.com\")"}},
+                "vuln_matches": [],
+            }
+            csv_path = sentinelscan.write_csv_report(payload, report)
+            csv_text = csv_path.read_text(encoding="utf-8")
+            self.assertIn("'=HYPERLINK", csv_text)
+
+    def test_csv_banner_leading_whitespace_formula_is_neutralized(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "report.txt"
+            payload = {
+                "target": "localhost",
+                "ip": "127.0.0.1",
+                "duration": 0.1,
+                "ports": {"tcp/80": {"open": True, "banner": "  =SUM(1,1)"}},
+                "vuln_matches": [],
+            }
+            csv_path = sentinelscan.write_csv_report(payload, report)
+            csv_text = csv_path.read_text(encoding="utf-8")
+            self.assertIn("'  =SUM", csv_text)
 
     def test_vulnerability_requires_service_and_version(self):
         matches = sentinelscan.vuln_analysis_from_banners_txt(

@@ -12,6 +12,18 @@ requires-python = ">=3.11"
 [project.optional-dependencies]
 rich = ["rich>=13"]
 
+[project.scripts]
+sentinelscan = "SentinelScan:main"
+
+[tool.setuptools]
+py-modules = ["SentinelScan"]
+
+[tool.setuptools.package-data]
+"*" = ["vuln_db.txt"]
+
+[tool.setuptools.data-files]
+"." = ["vuln_db.txt"]
+
 [tool.pytest.ini_options]
 testpaths = ["."]
 python_files = ["test_*.py"]

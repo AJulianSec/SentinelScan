@@ -13,6 +13,8 @@ Use it only for systems you own or have permission to test.
 Reports:
     reports/<target>_<timestamp>/report.txt
     reports/<target>_<timestamp>/report.json
+    reports/<target>_<timestamp>/report.csv
+    reports/<target>_<timestamp>/report.html
 
 Log file:
     logs/scanner.log
@@ -31,6 +33,8 @@ import ipaddress
 import json
 import logging
 import logging.handlers
+import math
+import os
 import re
 import socket
 import sys
@@ -52,7 +56,7 @@ except Exception:
     console = None
 
 # Configuration
-AUTHOR = "Your Name Here"
+AUTHOR = "Adria Julian"
 DEFAULT_TIMEOUT = 1.0
 DEFAULT_CONCURRENCY = 200
 COMMON_TCP_PORTS = [21, 22, 23, 25, 53, 80, 110, 139, 143, 443, 445, 3306, 3389, 8080]
@@ -60,13 +64,38 @@ COMMON_UDP_PORTS = [53, 67, 68, 69, 123, 161, 500, 520]
 MAX_CONCURRENCY = 1000
 
 BASE_DIR = Path(__file__).resolve().parent
-LOG_DIR = BASE_DIR / "logs"
+
+
+def _runtime_data_dir() -> Path:
+    configured = os.environ.get("SENTINELSCAN_DATA_DIR")
+    if configured:
+        return Path(configured).expanduser().resolve()
+
+    if (BASE_DIR / "vuln_db.txt").exists():
+        try:
+            (BASE_DIR / "logs").mkdir(parents=True, exist_ok=True)
+            (BASE_DIR / "reports").mkdir(parents=True, exist_ok=True)
+            return BASE_DIR
+        except OSError:
+            pass
+
+    if os.name == "nt":
+        base = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+    else:
+        base = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share"))
+    return base / "SentinelScan"
+
+
+RUNTIME_DATA_DIR = _runtime_data_dir()
+LOG_DIR = RUNTIME_DATA_DIR / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 LOG_FILE = LOG_DIR / "scanner.log"
 
 VULN_DB_FILE = BASE_DIR / "vuln_db.txt"
+if not VULN_DB_FILE.exists():
+    VULN_DB_FILE = RUNTIME_DATA_DIR / "vuln_db.txt"
 
-REPORTS_DIR = BASE_DIR / "reports"
+REPORTS_DIR = RUNTIME_DATA_DIR / "reports"
 REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
 # Logging
@@ -312,7 +341,7 @@ def version_matches(detected: Optional[str], version_expression: str) -> bool:
     if not detected or not version_expression:
         return False
     expression = version_expression.strip()
-    if expression.startswith((">=", "<=", "==", "!=")):
+    if re.match(r"^\s*(?:>=|<=|==|!=|>|<)\s*\d", expression):
         # Numeric ranges are safer than loose text matching. Splitting the
         # version at each dot lets the function compare 6.10 correctly as
         # newer than 6.9 rather than comparing the text from left to right.
@@ -596,6 +625,14 @@ def write_json_report(payload: Dict[str, Any], report_path: Path) -> Path:
         raise
 
 
+def _csv_safe(value: Any) -> str:
+    text = "-" if value is None else str(value)
+    stripped = text.lstrip(" \t\r\n")
+    if stripped.startswith(("=", "+", "-", "@")) or text.startswith(("\t", "\r", "\n")):
+        return "'" + text
+    return text
+
+
 def write_csv_report(payload: Dict[str, Any], report_path: Path) -> Path:
     csv_path = report_path.with_suffix(".csv")
     try:
@@ -613,7 +650,12 @@ def write_csv_report(payload: Dict[str, Any], report_path: Path) -> Path:
                     status = "open"
                 else:
                     status = "closed"
-                writer.writerow([protocol, port, status, banner or "-"])
+                writer.writerow([
+                    _csv_safe(protocol),
+                    _csv_safe(port),
+                    _csv_safe(status),
+                    _csv_safe(banner),
+                ])
         logger.info("CSV report written -> %s", csv_path)
         return csv_path
     except Exception as e:
@@ -913,6 +955,13 @@ async def main_cli_loop() -> None:
             if ip is None:
                 _print("Could not resolve target.")
                 continue
+            if not (target in ("localhost", "127.0.0.1", "::1") or is_private_ip(ip)):
+                _print(f"Target {target} resolves to {ip}, it appears to be external.")
+                confirm = input(f"Type '{target} PERMISSION' to confirm authorization: ").strip()
+                logger.info("Banner external confirm: %s", confirm)
+                if confirm != f"{target} PERMISSION":
+                    _print("External permission not granted.")
+                    continue
             port_s = input("Port for banner grab (e.g. 22): ").strip()
             proto = input("Protocol (tcp/udp) [tcp]: ").strip().lower() or 'tcp'
             try:
@@ -1029,7 +1078,10 @@ async def run_headless(args: argparse.Namespace) -> int:
             return 2
         logger.info("External target authorized via --yes: %s (%s)", args.target, ip)
 
-    timeout = max(0.1, args.timeout)
+    timeout = args.timeout
+    if not math.isfinite(timeout) or timeout < 0.1:
+        _print("Invalid timeout. Use a finite value of at least 0.1 seconds.")
+        return 2
     concurrency = max(1, min(MAX_CONCURRENCY, args.concurrency))
 
     if args.banner:
