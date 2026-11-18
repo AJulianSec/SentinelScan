@@ -263,6 +263,27 @@ Run the unit test suite with:
 python -m unittest test_SentinelScan.py
 ```
 
+## Source Integrity (SHA-256)
+
+The following SHA-256 hashes allow users to verify that the Python source files have not been modified after publication.
+
+| File | SHA-256 |
+|---|---|
+| `SentinelScan.py` | `F26EA762D2F7671AFE8A1C778B34B8900957234FF88675734D24B655A11A7914` |
+| `test_SentinelScan.py` | `6615AEB47F59166C3CB27F51D99FC199270BE684908B9510CC32BD3D191F7135` |
+
+Verify a file on Windows PowerShell:
+
+```powershell
+Get-FileHash .\SentinelScan.py -Algorithm SHA256
+```
+
+Verify all Python files:
+
+```powershell
+Get-ChildItem -Filter *.py | Get-FileHash -Algorithm SHA256
+```
+
 The tests cover:
 
 - Valid and invalid port numbers
